@@ -43,7 +43,7 @@
 #include "thread_id.hpp"
 static unsigned get_thread_index()
 {
-	return Vulkan::get_current_thread_index();
+	return Util::get_current_thread_index();
 }
 #define LOCK() std::lock_guard<std::mutex> holder__{lock.lock}
 #define DRAIN_FRAME_LOCK() \
@@ -557,8 +557,10 @@ string Device::get_pipeline_cache_string() const
 void Device::init_pipeline_cache()
 {
 #ifdef GRANITE_VULKAN_FILESYSTEM
-	auto file = Granite::Global::filesystem()->open(Util::join("cache://pipeline_cache_", get_pipeline_cache_string(), ".bin"),
-	                                                Granite::FileMode::ReadOnly);
+	if (!system_handles.filesystem)
+		return;
+	auto file = system_handles.filesystem->open(Util::join("cache://pipeline_cache_", get_pipeline_cache_string(), ".bin"),
+	                                            Granite::FileMode::ReadOnly);
 	if (file)
 	{
 		auto size = file->get_size();
@@ -612,6 +614,9 @@ bool Device::get_pipeline_cache_data(uint8_t *data, size_t size)
 void Device::flush_pipeline_cache()
 {
 #ifdef GRANITE_VULKAN_FILESYSTEM
+	if (!system_handles.filesystem)
+		return;
+
 	size_t size = get_pipeline_cache_size();
 	if (!size)
 	{
@@ -619,8 +624,8 @@ void Device::flush_pipeline_cache()
 		return;
 	}
 
-	auto file = Granite::Global::filesystem()->open(Util::join("cache://pipeline_cache_", get_pipeline_cache_string(), ".bin"),
-	                                                Granite::FileMode::WriteOnly);
+	auto file = system_handles.filesystem->open(Util::join("cache://pipeline_cache_", get_pipeline_cache_string(), ".bin"),
+	                                            Granite::FileMode::WriteOnly);
 	if (!file)
 	{
 		LOGE("Failed to get pipeline cache data.\n");
@@ -756,8 +761,8 @@ void Device::set_context(const Context &context)
 	init_shader_manager_cache();
 #endif
 
-	timeline_trace_file = context.get_timeline_trace_file();
-	if (timeline_trace_file)
+	system_handles = context.get_system_handles();
+	if (system_handles.timeline_trace_file)
 		init_calibrated_timestamps();
 }
 
@@ -2123,13 +2128,15 @@ void Device::init_external_swapchain(const vector<ImageHandle> &swapchain_images
 	}
 }
 
-void Device::init_swapchain(const vector<VkImage> &swapchain_images, unsigned width, unsigned height, VkFormat format)
+void Device::init_swapchain(const vector<VkImage> &swapchain_images, unsigned width, unsigned height, VkFormat format,
+                            VkSurfaceTransformFlagBitsKHR transform)
 {
 	DRAIN_FRAME_LOCK();
 	wsi.swapchain.clear();
 	wait_idle_nolock();
 
-	const auto info = ImageCreateInfo::render_target(width, height, format);
+	auto info = ImageCreateInfo::render_target(width, height, format);
+	info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
 
 	wsi.index = 0;
 	wsi.touched = false;
@@ -2158,6 +2165,7 @@ void Device::init_swapchain(const vector<VkImage> &swapchain_images, unsigned wi
 		backbuffer->set_internal_sync_object();
 		backbuffer->disown_image();
 		backbuffer->get_view().set_internal_sync_object();
+		backbuffer->set_surface_transform(transform);
 		wsi.swapchain.push_back(backbuffer);
 		set_name(*backbuffer, "backbuffer");
 		backbuffer->set_swapchain_layout(VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
@@ -2520,7 +2528,7 @@ QueryPoolHandle Device::write_calibrated_timestamp()
 
 QueryPoolHandle Device::write_calibrated_timestamp_nolock()
 {
-	if (!timeline_trace_file)
+	if (!system_handles.timeline_trace_file)
 		return {};
 
 	auto handle = QueryPoolHandle(handle_pool.query.allocate(this, false));
@@ -2639,7 +2647,7 @@ bool Device::resample_calibrated_timestamps()
 void Device::recalibrate_timestamps()
 {
 	// Don't bother recalibrating timestamps if we're not tracing.
-	if (!timeline_trace_file)
+	if (!system_handles.timeline_trace_file)
 		return;
 
 	// Recalibrate every once in a while ...
@@ -2847,33 +2855,33 @@ void Device::PerFrame::begin()
 			else
 				ts.timestamp_tag->accumulate_time(1e-9 * double(end_ts - start_ts));
 
-			if (device.timeline_trace_file)
+			if (device.system_handles.timeline_trace_file)
 			{
 				start_ts = device.convert_timestamp_to_absolute_nsec(*ts.start_ts);
 				end_ts = device.convert_timestamp_to_absolute_nsec(*ts.end_ts);
 				min_timestamp_us = (std::min)(min_timestamp_us, start_ts);
 				max_timestamp_us = (std::max)(max_timestamp_us, end_ts);
 
-				auto *e = device.timeline_trace_file->allocate_event();
+				auto *e = device.system_handles.timeline_trace_file->allocate_event();
 				e->set_desc(ts.timestamp_tag->get_tag().c_str());
 				e->set_tid(ts.tid.c_str());
 				e->pid = frame_index + 1;
 				e->start_ns = start_ts;
 				e->end_ns = end_ts;
-				device.timeline_trace_file->submit_event(e);
+				device.system_handles.timeline_trace_file->submit_event(e);
 			}
 		}
 	}
 
-	if (device.timeline_trace_file && min_timestamp_us <= max_timestamp_us)
+	if (device.system_handles.timeline_trace_file && min_timestamp_us <= max_timestamp_us)
 	{
-		auto *e = device.timeline_trace_file->allocate_event();
+		auto *e = device.system_handles.timeline_trace_file->allocate_event();
 		e->set_desc("CPU + GPU full frame");
 		e->set_tid("Frame context");
 		e->pid = frame_index + 1;
 		e->start_ns = min_timestamp_us;
 		e->end_ns = max_timestamp_us;
-		device.timeline_trace_file->submit_event(e);
+		device.system_handles.timeline_trace_file->submit_event(e);
 	}
 
 	managers.timestamps.mark_end_of_frame_context();
@@ -3552,6 +3560,20 @@ InitialImageBuffer Device::create_image_staging_buffer(const ImageCreateInfo &in
 	unmap_host_buffer(*result.buffer, MEMORY_ACCESS_WRITE_BIT);
 	layout.build_buffer_image_copies(result.blits);
 	return result;
+}
+
+DeviceAllocationOwnerHandle Device::take_device_allocation_ownership(Image &image)
+{
+	if ((image.get_create_info().misc & IMAGE_MISC_FORCE_NO_DEDICATED_BIT) == 0)
+	{
+		LOGE("Must use FORCE_NO_DEDICATED_BIT to take ownership of memory.\n");
+		return DeviceAllocationOwnerHandle{};
+	}
+
+	if (!image.get_allocation().alloc || !image.get_allocation().base)
+		return DeviceAllocationOwnerHandle{};
+
+	return DeviceAllocationOwnerHandle(handle_pool.allocations.allocate(this, image.take_allocation_ownership()));
 }
 
 YCbCrImageHandle Device::create_ycbcr_image(const YCbCrImageCreateInfo &create_info)

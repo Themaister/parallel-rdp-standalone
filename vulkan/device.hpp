@@ -98,6 +98,7 @@ struct HandlePool
 	VulkanObjectPool<QueryPoolResult> query;
 	VulkanObjectPool<CommandBuffer> command_buffers;
 	VulkanObjectPool<BindlessDescriptorPool> bindless_descriptor_pool;
+	VulkanObjectPool<DeviceAllocationOwner> allocations;
 };
 
 class DebugChannelInterface
@@ -155,6 +156,8 @@ public:
 	friend class DescriptorSetAllocator;
 	friend class Shader;
 	friend class ImageResourceHolder;
+	friend class DeviceAllocationOwner;
+	friend struct DeviceAllocationDeleter;
 
 	Device();
 	~Device();
@@ -165,7 +168,8 @@ public:
 
 	// Only called by main thread, during setup phase.
 	void set_context(const Context &context);
-	void init_swapchain(const std::vector<VkImage> &swapchain_images, unsigned width, unsigned height, VkFormat format);
+	void init_swapchain(const std::vector<VkImage> &swapchain_images, unsigned width, unsigned height, VkFormat format,
+	                    VkSurfaceTransformFlagBitsKHR transform);
 	void init_external_swapchain(const std::vector<ImageHandle> &swapchain_images);
 	void init_frame_contexts(unsigned count);
 	const VolkDeviceTable &get_device_table() const;
@@ -178,7 +182,6 @@ public:
 	                                          uint32_t *count,
 	                                          const VkPerformanceCounterKHR **counters,
 	                                          const VkPerformanceCounterDescriptionKHR **desc);
-	bool init_timestamp_trace(const char *path);
 
 	ImageView &get_swapchain_view();
 	ImageView &get_swapchain_view(unsigned index);
@@ -253,6 +256,7 @@ public:
 	ImageHandle create_image_from_staging_buffer(const ImageCreateInfo &info, const InitialImageBuffer *buffer);
 	LinearHostImageHandle create_linear_host_image(const LinearHostImageCreateInfo &info);
 	YCbCrImageHandle create_ycbcr_image(const YCbCrImageCreateInfo &info);
+	DeviceAllocationOwnerHandle take_device_allocation_ownership(Image &image);
 
 	// Create staging buffers for images.
 	InitialImageBuffer create_image_staging_buffer(const ImageCreateInfo &info, const ImageInitialData *initial);
@@ -364,6 +368,11 @@ public:
 	// Generally, this should be called before you call next_frame_context().
 	void promote_read_write_caches_to_read_only();
 
+	const Context::SystemHandles &get_system_handles() const
+	{
+		return system_handles;
+	}
+
 private:
 	VkInstance instance = VK_NULL_HANDLE;
 	VkPhysicalDevice gpu = VK_NULL_HANDLE;
@@ -410,7 +419,7 @@ private:
 
 	uint64_t update_wrapped_device_timestamp(uint64_t ts);
 	int64_t convert_timestamp_to_absolute_nsec(const QueryPoolResult &handle);
-	Util::TimelineTraceFile *timeline_trace_file = nullptr;
+	Context::SystemHandles system_handles;
 
 	QueryPoolHandle write_timestamp_nolock(VkCommandBuffer cmd, VkPipelineStageFlagBits stage);
 	QueryPoolHandle write_calibrated_timestamp_nolock();
